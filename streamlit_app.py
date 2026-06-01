@@ -104,6 +104,170 @@ def gem_rate(pop: dict) -> Optional[float]:
     return (g10 / total * 100.0) if total else None
 
 
+# スニダンのカードID(apparel_id) → PSA SpecID の対応表。
+# 一度登録すれば、以降そのカードは SpecID 入力なしで自動的に GEM率 を表示する。
+import json as _json
+
+SPEC_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spec_map.json")
+
+
+def load_spec_map() -> dict:
+    try:
+        with open(SPEC_MAP_FILE, "r", encoding="utf-8") as f:
+            return {int(k): int(v) for k, v in _json.load(f).items()}
+    except Exception:
+        return {}
+
+
+def save_spec_map(m: dict) -> bool:
+    """対応表をファイルに保存（ローカルや永続FSでは保存成功、Streamlit Cloudの一時FSでは
+    再起動でリセットされる点に注意。確実な永続化はリポジトリ同梱の spec_map.json で行う）。"""
+    try:
+        with open(SPEC_MAP_FILE, "w", encoding="utf-8") as f:
+            _json.dump({str(k): int(v) for k, v in m.items()}, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def resolve_spec_id(apparel_id: int) -> Optional[int]:
+    """このカードの SpecID を、セッション登録分→ファイル対応表 の順に解決。"""
+    sess_map = st.session_state.get("spec_map_session", {})
+    if apparel_id in sess_map:
+        return sess_map[apparel_id]
+    return load_spec_map().get(apparel_id)
+
+
+# ---------------- GEM率 自動取得（PriceChartingのPSA pop） ----------------
+# スニダンの英語名 → PriceChartingで該当カードを特定 → セットpopページの
+# PSA10数/総数から GEM率 を自動算出（手入力不要・PSAトークン不要）。
+import html as _htmlmod
+import urllib.parse as _urlparse
+
+PC_BASE = "https://www.pricecharting.com"
+_RARITY_RE = re.compile(r"\b(RRR|RR|SR|SAR|UR|AR|CHR|CSR|HR|GX)\b")
+
+
+def _pc_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": UA})
+    return s
+
+
+def _parse_pc_query(detail: dict) -> tuple[str, str, Optional[int]]:
+    """スニダンの英語名から (検索用フルネーム, セット名, カード番号) を抽出。"""
+    nm = detail.get("name") or detail.get("localizedName") or ""
+    setm = re.findall(r"\(([^()]*)\)\s*$", nm)
+    set_name = setm[-1] if setm else ""
+    for junk in ['"', "High Class Pack", "Enhanced Expansion Pack", "Expansion Pack", "Subset"]:
+        set_name = set_name.replace(junk, "")
+    set_name = re.sub(r"\s+", " ", set_name).strip()
+    num = re.search(r"(\d{1,3})\s*/\s*\d{1,3}", nm)
+    card_no = int(num.group(1)) if num else None
+    full_subj = nm.split("[")[0].strip()
+    return full_subj, set_name, card_no
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _pc_set_pop(set_slug: str) -> dict:
+    """PriceChartingのセットpopページから {product_slug: (PSA10数, 総数)} を取得（24h キャッシュ）。"""
+    sess = _pc_session()
+    url = f"{PC_BASE}/pop/set/{_urlparse.quote(set_slug, safe='-&')}"
+    try:
+        r = sess.get(url, timeout=20)
+        r.raise_for_status()
+    except Exception:
+        return {}
+    out: dict = {}
+    for m in re.finditer(r"<tr[^>]*>((?:(?!</tr>).)*?)</tr>", r.text, re.S):
+        row = m.group(1)
+        link = re.search(r'/pop/item/[^/"]+/([^/"?]+)"', row)
+        if not link:
+            continue
+        prod = _htmlmod.unescape(link.group(1))
+        nums = [int(x.replace(",", "")) for x in re.findall(r">\s*([\d,]+)\s*<", row)
+                if x.strip().replace(",", "").isdigit()]
+        if len(nums) >= 2:
+            out[prod] = (nums[-2], nums[-1])  # (PSA10, 総数)
+    return out
+
+
+def _pc_resolve(detail: dict) -> Optional[tuple[str, str]]:
+    """検索でカードを特定し (set_slug, product_slug) を返す。確証が無ければ None（誤答防止）。"""
+    full_subj, set_name, card_no = _parse_pc_query(detail)
+    sess = _pc_session()
+    try:
+        r = sess.get(f"{PC_BASE}/search-products",
+                     params={"q": f"{full_subj} {set_name}".strip(), "type": "prices"}, timeout=15)
+        h = r.text
+    except Exception:
+        return None
+
+    def tail_ok(prod: str) -> bool:
+        t = re.search(r"-(\d+)$", prod)
+        return bool(t) and card_no is not None and int(t.group(1)) == card_no
+
+    base_token = re.sub(_RARITY_RE, "", full_subj).split()
+    base_token = base_token[0].lower() if base_token else ""
+
+    rows = re.findall(r'<tr[^>]*data-product="(\d+)"[^>]*>(.*?)</tr>', h, re.S)
+    cands = []
+    for _pid, row in rows:
+        txt = re.sub(r"\s+", " ", _htmlmod.unescape(re.sub(r"<[^>]+>", " ", row))).strip()
+        href = re.search(r'/game/([^/"]+)/([^/"?]+)"', row)
+        if not href:
+            continue
+        setslug = _htmlmod.unescape(href.group(1))
+        prod = _htmlmod.unescape(href.group(2))
+        is_jp = "japanese" in setslug.lower() or "Japanese" in txt
+        num_ok = (card_no is not None and f"#{card_no}" in txt) or tail_ok(prod)
+        subj_ok = (base_token in txt.lower()) if base_token else True
+        if is_jp and num_ok and subj_ok:
+            cands.append((setslug, prod))
+    cands = list(dict.fromkeys(cands))
+    if len(cands) == 1:
+        return cands[0]
+    if len(cands) > 1:
+        exact = [c for c in cands if tail_ok(c[1])]
+        return exact[0] if len(exact) == 1 else None
+    # 単一商品ページへリダイレクトされたケース
+    uniq = list(dict.fromkeys(
+        (_htmlmod.unescape(s), _htmlmod.unescape(p))
+        for s, p in re.findall(r'/game/([^/"]+)/([^/"?]+)"', h)
+    ))
+    jp_exact = list({(s, p) for s, p in uniq if "japanese" in s.lower() and tail_ok(p)})
+    if len(jp_exact) == 1:
+        return jp_exact[0]
+    jp_any = list({(s, p) for s, p in uniq if "japanese" in s.lower()})
+    if len(jp_any) == 1:
+        return jp_any[0]
+    return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_gem_auto(apparel_id: int) -> Optional[dict]:
+    """カードのGEM率を自動取得。成功時 {rate, psa10, total, set_slug, product_slug}、不可時 None。"""
+    try:
+        detail = fetch_apparel_detail(apparel_id)
+    except Exception:
+        return None
+    res = _pc_resolve(detail)
+    if not res:
+        return None
+    set_slug, prod = res
+    pop = _pc_set_pop(set_slug)
+    if prod not in pop:
+        return None
+    psa10, total = pop[prod]
+    if not total:
+        return None
+    return {
+        "rate": round(psa10 / total * 100, 1),
+        "psa10": psa10, "total": total,
+        "set_slug": set_slug, "product_slug": prod,
+    }
+
+
 @dataclass
 class Candidate:
     apparel_id: int
@@ -329,20 +493,12 @@ with st.form("search_form", clear_on_submit=False):
     with col_btn:
         st.markdown("<div style='height:1.85em'></div>", unsafe_allow_html=True)  # ラベル高さ合わせ
         go = st.form_submit_button("🔍 相場を出す", type="primary", use_container_width=True)
-    spec_raw = st.text_input(
-        "PSA SpecID（任意・GEM率を出したいとき）",
-        value=st.session_state.get("spec_raw", ""),
-        placeholder="例: 8000000　※PSA popのカードページURL末尾の数字 / PSA pop URLを貼ってもOK",
-    )
 st.caption(
     "カード名＋型番（例: `ミュウ 054`）で検索 / "
     "スニダンのURL（`https://snkrdunk.com/apparels/...`）や商品IDを直接貼ってもOK。Enterでも検索できます。"
 )
 
 selected_id: Optional[int] = None
-
-if go:
-    st.session_state["spec_raw"] = spec_raw
 
 if go and raw.strip():
     st.session_state["raw"] = raw
@@ -399,6 +555,7 @@ if selected_id:
                 label: ex.submit(fetch_sales_history_multi, selected_id, cids, lb)
                 for label, cids, _cond_str in GRADES
             }
+            f_gem = ex.submit(fetch_gem_auto, selected_id)  # GEM率も並列取得
             grade_data = {}
             for label, _cids, _cond_str in GRADES:
                 try:
@@ -410,6 +567,10 @@ if selected_id:
                 except Exception:
                     hist = []
                 grade_data[label] = {"min_listed": ml, "history": hist}
+            try:
+                gem = f_gem.result()
+            except Exception:
+                gem = None
 
     st.divider()
     c0, c1 = st.columns([1, 3])
@@ -472,23 +633,12 @@ if selected_id:
                   delta=f"{pm['gap']:+,}円" if pm["gap"] is not None else None)
         st.caption("マイナス＝最高成約より安く出ている")
     with m4:
-        spec_id = extract_spec_id(st.session_state.get("spec_raw", ""))
-        if spec_id:
-            pop = fetch_psa_population(spec_id)
-            gr = gem_rate(pop) if pop else None
-            if gr is not None:
-                st.metric("💎 GEM率", f"{gr:.1f}%")
-                psapop = pop["PSAPop"]
-                st.caption(f"PSA10 {psapop.get('Grade10'):,} / 全{psapop.get('Total'):,}枚")
-            elif not _psa_token():
-                st.metric("💎 GEM率", "—")
-                st.caption("PSA APIトークン未設定")
-            else:
-                st.metric("💎 GEM率", "—")
-                st.caption(f"SpecID {spec_id} のpop取得不可")
+        if gem:
+            st.metric("💎 GEM率", f"{gem['rate']:.1f}%")
+            st.caption(f"PSA10 {gem['psa10']:,} / 全{gem['total']:,}枚")
         else:
             st.metric("💎 GEM率", "—")
-            st.caption("PSA SpecID未入力")
+            st.caption("PSA popを自動特定できず（カード名/型番が特殊な場合）")
 
     for label, *_ in GRADES:
         hist = grade_data[label]["history"]
