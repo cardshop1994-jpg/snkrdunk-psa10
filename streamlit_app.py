@@ -257,19 +257,23 @@ st.set_page_config(page_title="スニダンPSA10相場", page_icon="🎴", layou
 st.title("🎴 スニダン PSA10 ポケカ相場")
 st.caption("売れてる最高値（過去N日の成約）と 売れてない最安値（現在の最安出品）を算出")
 
-with st.sidebar:
-    st.subheader("対象カードの指定")
-    raw = st.text_input(
-        "キーワード / スニダンURL / 商品ID",
-        value=st.session_state.get("raw", ""),
-        placeholder="例: ミュウ 054  /  リザードン SAR  /  https://snkrdunk.com/apparels/704401",
-    )
-    lookback = st.number_input("成約集計の期間（日）", 7, 365, LOOKBACK_DAYS, step=7)
-    go = st.button("相場を出す", type="primary", use_container_width=True)
-    st.markdown(
-        "---\n**キーワード検索対応。** カード名＋型番（例: `ミュウ 054`）で検索できます。\n\n"
-        "URL（`https://snkrdunk.com/apparels/...`）や商品IDを直接貼ってもOK。"
-    )
+with st.form("search_form", clear_on_submit=False):
+    col_kw, col_days, col_btn = st.columns([6, 2, 2])
+    with col_kw:
+        raw = st.text_input(
+            "キーワード / スニダンURL / 商品ID",
+            value=st.session_state.get("raw", ""),
+            placeholder="例: ミュウ 054  /  リザードン SAR  /  https://snkrdunk.com/apparels/704401",
+        )
+    with col_days:
+        lookback = st.number_input("成約集計の期間（日）", 7, 365, LOOKBACK_DAYS, step=7)
+    with col_btn:
+        st.markdown("<div style='height:1.85em'></div>", unsafe_allow_html=True)  # ラベル高さ合わせ
+        go = st.form_submit_button("🔍 相場を出す", type="primary", use_container_width=True)
+st.caption(
+    "カード名＋型番（例: `ミュウ 054`）で検索 / "
+    "スニダンのURL（`https://snkrdunk.com/apparels/...`）や商品IDを直接貼ってもOK。Enterでも検索できます。"
+)
 
 selected_id: Optional[int] = None
 
@@ -417,4 +421,4 @@ if selected_id:
             else:
                 st.write("成約なし")
 elif not go:
-    st.info("左のサイドバーに スニダンURL・商品ID・キーワード のいずれかを入れて『相場を出す』を押してください。")
+    st.info("上の検索窓に スニダンURL・商品ID・キーワード のいずれかを入れて『相場を出す』を押してください。")
