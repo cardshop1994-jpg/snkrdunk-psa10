@@ -477,6 +477,30 @@ def yen(n: Optional[int]) -> str:
 # ---------------- UI ----------------
 
 st.set_page_config(page_title="スニダンPSA10相場", page_icon="🎴", layout="wide")
+
+# スマホ最適化: 狭い画面では横並びカラムを縦積みにし、文字サイズも調整
+st.markdown(
+    """
+    <style>
+      /* スマホ(〜640px): すべての横並びカラムを縦積みに */
+      @media (max-width: 640px) {
+        [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; gap: 0.3rem !important; }
+        [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
+        [data-testid="stHorizontalBlock"] > [data-testid="column"] {
+          flex: 1 1 100% !important; width: 100% !important; min-width: 100% !important;
+        }
+        .btn-spacer { display: none !important; }          /* PC用のボタン位置合わせをスマホでは無効化 */
+        [data-testid="stMetricValue"] { font-size: 1.45rem !important; }
+        h1 { font-size: 1.5rem !important; }
+        .block-container { padding: 0.6rem 0.8rem !important; }
+      }
+      /* テーブルは横スクロール可能に（列が多くても潰れない） */
+      [data-testid="stDataFrame"] { overflow-x: auto; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("🎴 スニダン ポケカ 相場アプリ(素体・PSA10)")
 st.caption("売れてる最高値（過去N日の成約）と 売れてない最安値（現在の最安出品）を算出")
 
@@ -491,7 +515,7 @@ with st.form("search_form", clear_on_submit=False):
     with col_days:
         lookback = st.number_input("成約集計の期間（日）", 7, 365, LOOKBACK_DAYS, step=7)
     with col_btn:
-        st.markdown("<div style='height:1.85em'></div>", unsafe_allow_html=True)  # ラベル高さ合わせ
+        st.markdown("<div class='btn-spacer' style='height:1.85em'></div>", unsafe_allow_html=True)  # PCでのラベル高さ合わせ（スマホでは非表示）
         go = st.form_submit_button("🔍 相場を出す", type="primary", use_container_width=True)
 st.caption(
     "カード名＋型番（例: `ミュウ 054`）で検索 / "
