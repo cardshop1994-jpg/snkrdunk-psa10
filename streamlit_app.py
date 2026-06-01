@@ -290,10 +290,23 @@ def _pc_resolve(detail: dict) -> Optional[tuple[str, str]]:
         if len(cands) == 1:
             return cands[0]
         if len(cands) > 1:
-            exact = [c for c in cands if tail_ok(c[1])]
-            if len(exact) == 1:
-                return exact[0]
-            continue  # 曖昧 → 次のクエリへ
+            exact = [c for c in cands if tail_ok(c[1])] or cands
+            # 変種（テクスチャエラー/スタンプ等）を除外して正規版を優先
+            VARIANT = ("texture", "error", "stamped", "staff", "reverse",
+                       "jumbo", "sealed", "poke-ball", "master-ball")
+            src_variant = any(w in (full_subj.lower()) for w in ("error", "texture", "stamp"))
+            if not src_variant:
+                plain = [c for c in exact if not any(w in c[1].lower() for w in VARIANT)]
+            else:
+                plain = exact
+            pick = plain if plain else exact
+            if len(pick) == 1:
+                return pick[0]
+            # まだ複数なら最短スラッグ（余計な修飾の無い基本カード）を採用
+            pick = sorted(pick, key=lambda c: len(c[1]))
+            if len(pick) >= 2 and len(pick[0][1]) < len(pick[1][1]):
+                return pick[0]
+            continue  # 真に曖昧 → 次のクエリへ
         # 単一商品ページへリダイレクトされたケース
         uniq = list(dict.fromkeys(
             (_htmlmod.unescape(s), _htmlmod.unescape(p))
