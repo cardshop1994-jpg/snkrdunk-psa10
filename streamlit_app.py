@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -43,6 +44,64 @@ def _session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": UA, "Accept-Language": "ja,en;q=0.9"})
     return s
+
+
+# ---------------- PSA Public API（GEM率） ----------------
+PSA_API_BASE = "https://api.psacard.com/publicapi"
+
+
+def _psa_token() -> Optional[str]:
+    """PSA APIトークンを Streamlit Secrets か環境変数から取得（コードには書かない）。"""
+    try:
+        tok = st.secrets.get("PSA_TOKEN")  # type: ignore[attr-defined]
+        if tok:
+            return str(tok).strip()
+    except Exception:
+        pass
+    tok = os.environ.get("PSA_TOKEN")
+    return tok.strip() if tok else None
+
+
+def extract_spec_id(text: str) -> Optional[int]:
+    """PSA pop の SpecID を、数値 or pop URL から取り出す。"""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    # pop URL 末尾などの数字（最後に出てくる長めの数字を採用）
+    nums = re.findall(r"(\d{4,})", text)
+    return int(nums[-1]) if nums else None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_psa_population(spec_id: int) -> Optional[dict]:
+    """PSA公式APIから spec_id の鑑定数内訳を取得。トークン未設定/失敗時は None。"""
+    token = _psa_token()
+    if not token or not spec_id:
+        return None
+    try:
+        r = requests.get(
+            f"{PSA_API_BASE}/pop/GetPSASpecPopulation/{spec_id}",
+            headers={"Authorization": f"bearer {token}"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not isinstance(data, dict) or not data.get("PSAPop"):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def gem_rate(pop: dict) -> Optional[float]:
+    """GEM率(%) = PSA10数 ÷ 全鑑定数。"""
+    p = (pop or {}).get("PSAPop") or {}
+    total = p.get("Total") or 0
+    g10 = p.get("Grade10") or 0
+    return (g10 / total * 100.0) if total else None
 
 
 @dataclass
@@ -270,12 +329,20 @@ with st.form("search_form", clear_on_submit=False):
     with col_btn:
         st.markdown("<div style='height:1.85em'></div>", unsafe_allow_html=True)  # ラベル高さ合わせ
         go = st.form_submit_button("🔍 相場を出す", type="primary", use_container_width=True)
+    spec_raw = st.text_input(
+        "PSA SpecID（任意・GEM率を出したいとき）",
+        value=st.session_state.get("spec_raw", ""),
+        placeholder="例: 8000000　※PSA popのカードページURL末尾の数字 / PSA pop URLを貼ってもOK",
+    )
 st.caption(
     "カード名＋型番（例: `ミュウ 054`）で検索 / "
     "スニダンのURL（`https://snkrdunk.com/apparels/...`）や商品IDを直接貼ってもOK。Enterでも検索できます。"
 )
 
 selected_id: Optional[int] = None
+
+if go:
+    st.session_state["spec_raw"] = spec_raw
 
 if go and raw.strip():
     st.session_state["raw"] = raw
@@ -393,7 +460,7 @@ if selected_id:
     # PSA10は従来どおりメトリクスでも強調表示
     pm = computed["PSA10"]
     st.markdown("#### PSA10 詳細")
-    m1, m2, m3 = st.columns(3)
+    m1, m2, m3, m4 = st.columns(4)
     with m1:
         st.metric(f"🔥 売れてる最高値（{lb}日）", yen(pm["sold_max"]))
         st.caption(f"件数{pm['count']} ・ 中央値{yen(pm['sold_med'])}" if pm["count"] else "対象期間に成約なし")
@@ -404,6 +471,24 @@ if selected_id:
         st.metric("📐 最安出品 − 最高成約", yen(pm["gap"]),
                   delta=f"{pm['gap']:+,}円" if pm["gap"] is not None else None)
         st.caption("マイナス＝最高成約より安く出ている")
+    with m4:
+        spec_id = extract_spec_id(st.session_state.get("spec_raw", ""))
+        if spec_id:
+            pop = fetch_psa_population(spec_id)
+            gr = gem_rate(pop) if pop else None
+            if gr is not None:
+                st.metric("💎 GEM率", f"{gr:.1f}%")
+                psapop = pop["PSAPop"]
+                st.caption(f"PSA10 {psapop.get('Grade10'):,} / 全{psapop.get('Total'):,}枚")
+            elif not _psa_token():
+                st.metric("💎 GEM率", "—")
+                st.caption("PSA APIトークン未設定")
+            else:
+                st.metric("💎 GEM率", "—")
+                st.caption(f"SpecID {spec_id} のpop取得不可")
+        else:
+            st.metric("💎 GEM率", "—")
+            st.caption("PSA SpecID未入力")
 
     for label, *_ in GRADES:
         hist = grade_data[label]["history"]
