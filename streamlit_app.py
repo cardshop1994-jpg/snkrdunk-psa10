@@ -39,6 +39,25 @@ GRADES = [
     ("PSA10", [PSA10_CONDITION_ID], str(PSA10_CONDITION_ID)),
 ]
 
+# 損益計算用: プラン別の鑑定費（全部入り＝鑑定料＋事務手数料＋送料保険の概算）と販売手数料
+GRADING_FEE = {"レギュラー": 13000, "バリューバルク": 5300}
+SALES_FEE_RATE = 0.10  # メルカリ等の販売手数料
+
+
+def profit_margin(acq_rate: float, raw_price: int, psa10_price: int, fee: int,
+                  sales_fee: float = SALES_FEE_RATE) -> Optional[dict]:
+    """損益計算（claude.aiで確定した式）。
+    期待売上 = 取得率×PSA10価格 + (1-取得率)×素体価格  （外れは素体価格で売れる想定）
+    利益 = 期待売上×(1-販売手数料) − (素体価格 + 鑑定費)
+    利益率 = 利益 ÷ 期待売上"""
+    p = max(0.0, min(1.0, acq_rate / 100.0))
+    exp_rev = p * psa10_price + (1 - p) * raw_price
+    if exp_rev <= 0:
+        return None
+    cost = raw_price + fee
+    profit = exp_rev * (1 - sales_fee) - cost
+    return {"margin": profit / exp_rev * 100.0, "profit": profit, "exp_rev": exp_rev}
+
 
 def _session() -> requests.Session:
     s = requests.Session()
@@ -664,6 +683,38 @@ if selected_id:
         else:
             st.metric("💎 GEM率", "—")
             st.caption("PSA popを自動特定できず（カード名/型番が特殊な場合）")
+
+    # ---------- 損益計算 ----------
+    st.markdown("#### 💰 損益計算（PSAに出した場合）")
+    def_acq = round(gem["rate"], 1) if gem else 70.0
+    def_raw = int(computed["素体"]["listed"] or computed["素体"]["sold_max"] or 0)
+    def_sell = int(computed["PSA10"]["listed"] or computed["PSA10"]["sold_max"] or 0)
+    p1, p2, p3, p4, p5 = st.columns(5)
+    with p1:
+        plan = st.selectbox("プラン", list(GRADING_FEE.keys()), key=f"pl_plan_{selected_id}")
+    with p2:
+        acq = st.number_input("取得率(%)", 0.0, 100.0, value=float(def_acq), step=1.0,
+                              key=f"pl_acq_{selected_id}")
+    with p3:
+        raw_price = st.number_input("素体価格(円)", 0, value=def_raw, step=500,
+                                    key=f"pl_raw_{selected_id}")
+    with p4:
+        sell10 = st.number_input("PSA10価格(円)", 0, value=def_sell, step=500,
+                                 key=f"pl_sell_{selected_id}")
+    fee = GRADING_FEE[plan]
+    res = profit_margin(acq, int(raw_price), int(sell10), fee)
+    with p5:
+        if res:
+            st.metric("📊 利益率", f"{res['margin']:.1f}%",
+                      delta="黒字" if res["margin"] > 0 else "赤字")
+            st.caption(f"1枚あたり利益 約{res['profit']:,.0f}円")
+        else:
+            st.metric("📊 利益率", "—")
+            st.caption("価格を入力してください")
+    st.caption(
+        f"鑑定費 {fee:,}円（{plan}・全部入り概算）・販売手数料{int(SALES_FEE_RATE*100)}%。"
+        "取得率の初期値はGEM率。外れ（PSA10以外）は素体価格で売れる前提です。"
+    )
 
     for label, *_ in GRADES:
         hist = grade_data[label]["history"]
