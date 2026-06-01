@@ -710,17 +710,13 @@ if selected_id:
     # PSA10は従来どおりメトリクスでも強調表示
     pm = computed["PSA10"]
     st.markdown("#### PSA10 詳細")
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m4 = st.columns(3)
     with m1:
-        st.metric(f"🔥 売れてる最高値（{lb}日）", yen(pm["sold_max"]))
-        st.caption(f"件数{pm['count']} ・ 中央値{yen(pm['sold_med'])}" if pm["count"] else "対象期間に成約なし")
+        st.metric(f"📈 売れてる中央値（{lb}日）", yen(pm["sold_med"]))
+        st.caption(f"件数 {pm['count']:,}件" if pm["count"] else "対象期間に成約なし")
     with m2:
         st.metric("🧊 売れてない最安値（現在出品）", yen(pm["listed"]))
         st.caption("PSA10の出品あり" if pm["listed"] else "PSA10の出品なし")
-    with m3:
-        st.metric("📐 最安出品 − 最高成約", yen(pm["gap"]),
-                  delta=f"{pm['gap']:+,}円" if pm["gap"] is not None else None)
-        st.caption("マイナス＝最高成約より安く出ている")
     with m4:
         if gem:
             st.metric("💎 GEM率", f"{gem['rate']:.1f}%")
