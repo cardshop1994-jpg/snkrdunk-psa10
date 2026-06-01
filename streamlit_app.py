@@ -173,27 +173,37 @@ def _pc_session() -> requests.Session:
     return s
 
 
-def _parse_pc_query(detail: dict) -> tuple[str, str, Optional[int]]:
-    """スニダンの英語名から (検索用フルネーム, セット名, カード番号) を抽出。"""
+def _parse_pc_query(detail: dict) -> tuple[str, str, Optional[int], Optional[str]]:
+    """スニダンの英語名から (検索用フルネーム, セット名, カード番号, プロモ接尾辞) を抽出。
+    通常: [s12a 054/172] → no=54。プロモ: [M-P 020]/[SV-P 291] → no=20/291, suffix='M-P'。"""
     nm = detail.get("name") or detail.get("localizedName") or ""
     setm = re.findall(r"\(([^()]*)\)\s*$", nm)
     set_name = setm[-1] if setm else ""
     for junk in ['"', "High Class Pack", "Enhanced Expansion Pack", "Expansion Pack", "Subset"]:
         set_name = set_name.replace(junk, "")
     set_name = re.sub(r"\s+", " ", set_name).strip()
-    num = re.search(r"(\d{1,3})\s*/\s*\d{1,3}", nm)
-    card_no = int(num.group(1)) if num else None
+    bracket = re.search(r"\[([^\]]+)\]", nm)
+    binner = bracket.group(1) if bracket else ""
+    card_no: Optional[int] = None
+    promo_suffix: Optional[str] = None
+    mnorm = re.search(r"(\d{1,3})\s*/\s*\d{1,3}", nm)
+    if mnorm:
+        card_no = int(mnorm.group(1))
+    mp = re.search(r"\b([A-Za-z0-9]{1,6}-P)\b\s*(\d{1,4})", binner)  # 例: M-P 020 / SV-P 291 / S8a-P 001
+    if mp:
+        promo_suffix = mp.group(1).upper()
+        card_no = int(mp.group(2))
     full_subj = nm.split("[")[0].strip()
-    return full_subj, set_name, card_no
+    return full_subj, set_name, card_no, promo_suffix
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def _pc_set_pop(set_slug: str) -> dict:
-    """PriceChartingのセットpopページから {product_slug: (PSA10数, 総数)} を取得（24h キャッシュ）。"""
+def _pc_set_pop_page(set_slug: str, page: int) -> dict:
+    """PriceChartingのセットpopページ(1ページ分)から {product_slug: (PSA10数, 総数)} を取得。"""
     sess = _pc_session()
     url = f"{PC_BASE}/pop/set/{_urlparse.quote(set_slug, safe='-&')}"
     try:
-        r = sess.get(url, timeout=20)
+        r = sess.get(url, params={"page": page} if page > 1 else None, timeout=20)
         r.raise_for_status()
     except Exception:
         return {}
@@ -211,55 +221,90 @@ def _pc_set_pop(set_slug: str) -> dict:
     return out
 
 
+def _pc_set_pop(set_slug: str, target: Optional[str] = None) -> dict:
+    """セットpopページ(1ページ目)から pop を取得。
+    ※PriceChartingの静的HTMLはページ送り非対応で上位約118件のみ。通常セットは全件収まるが、
+    　巨大なプロモセット等では下位カードが含まれず取得不可（その場合は呼び出し側で—表示）。"""
+    return _pc_set_pop_page(set_slug, 1)
+
+
 def _pc_resolve(detail: dict) -> Optional[tuple[str, str]]:
     """検索でカードを特定し (set_slug, product_slug) を返す。確証が無ければ None（誤答防止）。"""
-    full_subj, set_name, card_no = _parse_pc_query(detail)
+    full_subj, set_name, card_no, promo = _parse_pc_query(detail)
     sess = _pc_session()
-    try:
-        r = sess.get(f"{PC_BASE}/search-products",
-                     params={"q": f"{full_subj} {set_name}".strip(), "type": "prices"}, timeout=15)
-        h = r.text
-    except Exception:
-        return None
 
     def tail_ok(prod: str) -> bool:
         t = re.search(r"-(\d+)$", prod)
         return bool(t) and card_no is not None and int(t.group(1)) == card_no
 
-    base_token = re.sub(_RARITY_RE, "", full_subj).split()
-    base_token = base_token[0].lower() if base_token else ""
+    def num_ok(txt: str, prod: str) -> bool:
+        if promo and card_no is not None:
+            # プロモ: 例 "#20/M-P" / slug "pikachu-20m-p"
+            key = f"#{card_no}/{promo}".lower()
+            slug_key = f"{card_no}{promo.replace('-', '').lower()}"  # 20mp
+            slug_key2 = f"{card_no}{promo.lower()}"                  # 20m-p
+            return key in txt.lower() or slug_key in prod.replace("-", "").lower() or slug_key2 in prod.lower()
+        return (card_no is not None and f"#{card_no}" in txt) or tail_ok(prod)
 
-    rows = re.findall(r'<tr[^>]*data-product="(\d+)"[^>]*>(.*?)</tr>', h, re.S)
-    cands = []
-    for _pid, row in rows:
-        txt = re.sub(r"\s+", " ", _htmlmod.unescape(re.sub(r"<[^>]+>", " ", row))).strip()
-        href = re.search(r'/game/([^/"]+)/([^/"?]+)"', row)
-        if not href:
+    # クエリ用に主語を整える（カッコ・コロン・PROMO/レアリティ等のノイズを除去）
+    qsubj = re.sub(r"\([^)]*\)", " ", full_subj)
+    qsubj = re.sub(r"[:：]", " ", qsubj)
+    qsubj = re.sub(r"\b(PROMO|SA|HR|CSR|UR|SAR|SR|RRR|RR|AR|GX)\b", " ", qsubj, flags=re.I)
+    qsubj = re.sub(r"\s+", " ", qsubj).strip() or full_subj
+
+    base_token = qsubj.split()[0].lower() if qsubj.split() else ""
+
+    # 検索クエリは複数バリアントを順に試す（プロモや表記揺れ対策）
+    queries = [f"{qsubj} {set_name}".strip()]
+    if promo:
+        queries.append(f"{qsubj} {promo} japanese".strip())  # 例: Marnie S-P japanese（少トークンが有効）
+        queries.append(f"{qsubj} {card_no} {promo}".strip())
+        queries.append(f"{qsubj} promo {card_no}".strip())
+    queries.append(f"{qsubj} japanese {set_name}".strip())
+    queries.append(qsubj)
+    seen_q = set()
+    for q in queries:
+        if q in seen_q:
             continue
-        setslug = _htmlmod.unescape(href.group(1))
-        prod = _htmlmod.unescape(href.group(2))
-        is_jp = "japanese" in setslug.lower() or "Japanese" in txt
-        num_ok = (card_no is not None and f"#{card_no}" in txt) or tail_ok(prod)
-        subj_ok = (base_token in txt.lower()) if base_token else True
-        if is_jp and num_ok and subj_ok:
-            cands.append((setslug, prod))
-    cands = list(dict.fromkeys(cands))
-    if len(cands) == 1:
-        return cands[0]
-    if len(cands) > 1:
-        exact = [c for c in cands if tail_ok(c[1])]
-        return exact[0] if len(exact) == 1 else None
-    # 単一商品ページへリダイレクトされたケース
-    uniq = list(dict.fromkeys(
-        (_htmlmod.unescape(s), _htmlmod.unescape(p))
-        for s, p in re.findall(r'/game/([^/"]+)/([^/"?]+)"', h)
-    ))
-    jp_exact = list({(s, p) for s, p in uniq if "japanese" in s.lower() and tail_ok(p)})
-    if len(jp_exact) == 1:
-        return jp_exact[0]
-    jp_any = list({(s, p) for s, p in uniq if "japanese" in s.lower()})
-    if len(jp_any) == 1:
-        return jp_any[0]
+        seen_q.add(q)
+        try:
+            r = sess.get(f"{PC_BASE}/search-products",
+                         params={"q": q, "type": "prices"}, timeout=15)
+            h = r.text
+        except Exception:
+            continue
+        rows = re.findall(r'<tr[^>]*data-product="(\d+)"[^>]*>(.*?)</tr>', h, re.S)
+        cands = []
+        for _pid, row in rows:
+            txt = re.sub(r"\s+", " ", _htmlmod.unescape(re.sub(r"<[^>]+>", " ", row))).strip()
+            href = re.search(r'/game/([^/"]+)/([^/"?]+)"', row)
+            if not href:
+                continue
+            setslug = _htmlmod.unescape(href.group(1))
+            prod = _htmlmod.unescape(href.group(2))
+            is_jp = "japanese" in setslug.lower() or "Japanese" in txt
+            subj_ok = (base_token in txt.lower()) if base_token else True
+            if is_jp and num_ok(txt, prod) and subj_ok:
+                cands.append((setslug, prod))
+        cands = list(dict.fromkeys(cands))
+        if len(cands) == 1:
+            return cands[0]
+        if len(cands) > 1:
+            exact = [c for c in cands if tail_ok(c[1])]
+            if len(exact) == 1:
+                return exact[0]
+            continue  # 曖昧 → 次のクエリへ
+        # 単一商品ページへリダイレクトされたケース
+        uniq = list(dict.fromkeys(
+            (_htmlmod.unescape(s), _htmlmod.unescape(p))
+            for s, p in re.findall(r'/game/([^/"]+)/([^/"?]+)"', h)
+        ))
+        jp_exact = list({(s, p) for s, p in uniq if "japanese" in s.lower() and tail_ok(p)})
+        if len(jp_exact) == 1:
+            return jp_exact[0]
+        jp_any = list({(s, p) for s, p in uniq if "japanese" in s.lower()})
+        if len(jp_any) == 1:
+            return jp_any[0]
     return None
 
 
@@ -274,7 +319,7 @@ def fetch_gem_auto(apparel_id: int) -> Optional[dict]:
     if not res:
         return None
     set_slug, prod = res
-    pop = _pc_set_pop(set_slug)
+    pop = _pc_set_pop(set_slug, target=prod)
     if prod not in pop:
         return None
     psa10, total = pop[prod]
