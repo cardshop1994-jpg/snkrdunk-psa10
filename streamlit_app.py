@@ -492,7 +492,8 @@ st.markdown(
         .btn-spacer { display: none !important; }          /* PC用のボタン位置合わせをスマホでは無効化 */
         [data-testid="stMetricValue"] { font-size: 1.45rem !important; }
         h1 { font-size: 1.5rem !important; }
-        .block-container { padding: 0.6rem 0.8rem !important; }
+        /* 上部はStreamlit固定ヘッダーを避けて十分に空ける（左右だけ詰める） */
+        .block-container { padding: 3.2rem 0.8rem 1rem !important; }
       }
       /* テーブルは横スクロール可能に（列が多くても潰れない） */
       [data-testid="stDataFrame"] { overflow-x: auto; }
