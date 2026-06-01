@@ -254,7 +254,7 @@ def yen(n: Optional[int]) -> str:
 # ---------------- UI ----------------
 
 st.set_page_config(page_title="スニダンPSA10相場", page_icon="🎴", layout="wide")
-st.title("🎴 スニダン PSA10 ポケカ相場")
+st.title("🎴 スニダン ポケカ 相場アプリ(素体・PSA10)")
 st.caption("売れてる最高値（過去N日の成約）と 売れてない最安値（現在の最安出品）を算出")
 
 with st.form("search_form", clear_on_submit=False):
