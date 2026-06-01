@@ -190,9 +190,13 @@ def _parse_pc_query(detail: dict) -> tuple[str, str, Optional[int], Optional[str
     if mnorm:
         card_no = int(mnorm.group(1))
     mp = re.search(r"\b([A-Za-z0-9]{1,6}-P)\b\s*(\d{1,4})", binner)  # 例: M-P 020 / SV-P 291 / S8a-P 001
+    mp2 = re.search(r"(\d{1,4})\s*/\s*([A-Za-z0-9]{1,6}-P)\b", binner)  # 例: 030/XY-P（番号→接尾辞）
     if mp:
         promo_suffix = mp.group(1).upper()
         card_no = int(mp.group(2))
+    elif mp2:
+        card_no = int(mp2.group(1))
+        promo_suffix = mp2.group(2).upper()
     full_subj = nm.split("[")[0].strip()
     return full_subj, set_name, card_no, promo_suffix
 
