@@ -28,6 +28,16 @@ PSA10_CONDITION_ID = 22
 SEARCH_CATEGORY_TCG = 6
 LOOKBACK_DAYS = 90
 
+# スニダンの状態(condition)ID。素体(未鑑定)はランクA〜D、鑑定はPSA等。
+RAW_CONDITION_IDS = [18, 19, 20, 21]  # A / B / C / D（素体・未鑑定）
+PSA9_CONDITION_ID = 23
+# 表示するグレード定義: (ラベル, 成約履歴用のcondition_idリスト, 最安出品用のconditionIds文字列)
+GRADES = [
+    ("素体", RAW_CONDITION_IDS, ",".join(map(str, RAW_CONDITION_IDS))),
+    ("PSA9", [PSA9_CONDITION_ID], str(PSA9_CONDITION_ID)),
+    ("PSA10", [PSA10_CONDITION_ID], str(PSA10_CONDITION_ID)),
+]
+
 
 def _session() -> requests.Session:
     s = requests.Session()
@@ -125,14 +135,15 @@ def fetch_apparel_detail(apparel_id: int) -> dict:
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_min_listed_psa10(apparel_id: int) -> Optional[dict]:
+def fetch_min_listed(apparel_id: int, condition_ids: str) -> Optional[dict]:
+    """指定状態の現在出品中で最安の1件を返す。condition_ids はカンマ区切り可（例: '18,19,20,21'）。"""
     r = _session().get(
         f"{BASE}/v1/apparels/{apparel_id}/used",
         params={
             "perPage": 1,
             "page": 1,
             "isSaleOnly": "true",
-            "conditionIds": PSA10_CONDITION_ID,
+            "conditionIds": condition_ids,
             "order": "cheaper",
         },
         timeout=15,
@@ -140,6 +151,10 @@ def fetch_min_listed_psa10(apparel_id: int) -> Optional[dict]:
     r.raise_for_status()
     items = r.json().get("apparelUsedItems") or []
     return items[0] if items else None
+
+
+def fetch_min_listed_psa10(apparel_id: int) -> Optional[dict]:
+    return fetch_min_listed(apparel_id, str(PSA10_CONDITION_ID))
 
 
 _REL_RE = re.compile(r"^(\d+)\s*(時間|日|週間|ヶ月|か月|年)前$")
@@ -175,18 +190,21 @@ def parse_relative_date(s: str, now: Optional[datetime] = None) -> Optional[date
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_sales_history_psa10(
-    apparel_id: int, lookback_days: int = LOOKBACK_DAYS, max_pages: int = 10, per_page: int = 200
+def fetch_sales_history(
+    apparel_id: int, condition_id: int, lookback_days: int = LOOKBACK_DAYS,
+    max_pages: int = 10, per_page: int = 200,
 ) -> list[dict]:
-    """per_page を大きめにしてページ往復を最小化（API は 200 件/ページまで返す）。
-    cutoff より古い成約に達した時点で打ち切る。"""
+    """指定状態(condition_id 単一)の成約履歴を lookback_days 分だけ返す。
+    per_page を大きめにしてページ往復を最小化（API は 200 件/ページまで）。
+    cutoff より古い成約に達した時点で打ち切る。
+    ※ sales-history はカンマ区切り複数IDを受け付けないため condition_id は1つだけ。"""
     sess = _session()
     cutoff = datetime.now() - timedelta(days=lookback_days)
     results: list[dict] = []
     for page in range(1, max_pages + 1):
         r = sess.get(
             f"{BASE}/v1/apparels/{apparel_id}/sales-history",
-            params={"page": page, "per_page": per_page, "condition_id": PSA10_CONDITION_ID},
+            params={"page": page, "per_page": per_page, "condition_id": condition_id},
             timeout=15,
         )
         r.raise_for_status()
@@ -206,6 +224,27 @@ def fetch_sales_history_psa10(
         if len(history) < per_page:
             break
     return results
+
+
+def fetch_sales_history_multi(
+    apparel_id: int, condition_ids: list[int], lookback_days: int = LOOKBACK_DAYS
+) -> list[dict]:
+    """複数状態（素体A〜D等）の成約履歴をまとめて取得（各IDを並列取得して結合）。"""
+    if len(condition_ids) == 1:
+        return fetch_sales_history(apparel_id, condition_ids[0], lookback_days)
+    merged: list[dict] = []
+    with ThreadPoolExecutor(max_workers=len(condition_ids)) as ex:
+        futs = [ex.submit(fetch_sales_history, apparel_id, cid, lookback_days) for cid in condition_ids]
+        for f in futs:
+            try:
+                merged.extend(f.result())
+            except Exception:
+                pass
+    return merged
+
+
+def fetch_sales_history_psa10(apparel_id: int, lookback_days: int = LOOKBACK_DAYS) -> list[dict]:
+    return fetch_sales_history(apparel_id, PSA10_CONDITION_ID, lookback_days)
 
 
 def yen(n: Optional[int]) -> str:
@@ -277,19 +316,29 @@ if selected_id:
         st.error(f"商品情報の取得に失敗しました（ID={selected_id}）: {e}")
         st.stop()
 
-    with st.spinner("相場取得中…"):
-        # 最安出品 と 成約履歴 は独立なので並列取得して待ち時間を短縮
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            f_min = ex.submit(fetch_min_listed_psa10, selected_id)
-            f_hist = ex.submit(fetch_sales_history_psa10, selected_id, int(lookback))
-            try:
-                min_listed = f_min.result()
-            except Exception:
-                min_listed = None
-            try:
-                history = f_hist.result()
-            except Exception:
-                history = []
+    with st.spinner("相場取得中…（素体 / PSA9 / PSA10）"):
+        lb = int(lookback)
+        # 全グレードの最安出品・成約履歴を一括並列取得
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            f_listed = {
+                label: ex.submit(fetch_min_listed, selected_id, cond_str)
+                for label, _cids, cond_str in GRADES
+            }
+            f_hist = {
+                label: ex.submit(fetch_sales_history_multi, selected_id, cids, lb)
+                for label, cids, _cond_str in GRADES
+            }
+            grade_data = {}
+            for label, _cids, _cond_str in GRADES:
+                try:
+                    ml = f_listed[label].result()
+                except Exception:
+                    ml = None
+                try:
+                    hist = f_hist[label].result()
+                except Exception:
+                    hist = []
+                grade_data[label] = {"min_listed": ml, "history": hist}
 
     st.divider()
     c0, c1 = st.columns([1, 3])
@@ -305,41 +354,67 @@ if selected_id:
         )
         st.link_button("スニダンで開く", f"{BASE}/apparels/{selected_id}")
 
-    prices = [h["price"] for h in history if isinstance(h.get("price"), int)]
-    sold_max = max(prices) if prices else None
-    sold_max_entry = max(history, key=lambda h: h.get("price", 0)) if prices else None
-    sold_med = sorted(prices)[len(prices) // 2] if prices else None
-    listed_price = (min_listed or {}).get("price")
+    # 各グレードの指標を計算
+    def metrics_of(d: dict) -> dict:
+        prices = [h["price"] for h in d["history"] if isinstance(h.get("price"), int)]
+        sold_max = max(prices) if prices else None
+        sold_med = sorted(prices)[len(prices) // 2] if prices else None
+        listed = (d["min_listed"] or {}).get("price")
+        gap = (listed - sold_max) if (sold_max and isinstance(listed, int)) else None
+        return {
+            "sold_max": sold_max, "sold_med": sold_med, "count": len(prices),
+            "listed": listed, "gap": gap,
+        }
 
+    computed = {label: metrics_of(grade_data[label]) for label, *_ in GRADES}
+
+    st.subheader(f"グレード別相場（成約は過去{lb}日）")
+    table_rows = []
+    for label, *_ in GRADES:
+        m = computed[label]
+        table_rows.append({
+            "状態": label,
+            "🔥売れてる最高値": yen(m["sold_max"]),
+            "🧊売れてない最安値": yen(m["listed"]),
+            "成約件数": m["count"],
+            "成約中央値": yen(m["sold_med"]),
+            "最安−最高(差額)": (f"{m['gap']:+,}円" if m["gap"] is not None else "—"),
+        })
+    st.dataframe(table_rows, use_container_width=True, hide_index=True)
+    st.caption(
+        "「素体」はランクA〜Dの未鑑定カードを合算（最安値は状態を問わず最も安い出品）。"
+        "🔥=実際に売れた最高値 / 🧊=現在出品中の最安値。差額がマイナス＝最高成約より安く出ている。"
+    )
+
+    # PSA10は従来どおりメトリクスでも強調表示
+    pm = computed["PSA10"]
+    st.markdown("#### PSA10 詳細")
     m1, m2, m3 = st.columns(3)
     with m1:
-        st.metric(f"🔥 売れてる最高値（{int(lookback)}日）", yen(sold_max))
-        if sold_max_entry:
-            st.caption(f"成約: {sold_max_entry.get('date')} ・ 件数{len(prices)} ・ 中央値{yen(sold_med)}")
-        elif not history:
-            st.caption("対象期間に成約なし")
+        st.metric(f"🔥 売れてる最高値（{lb}日）", yen(pm["sold_max"]))
+        st.caption(f"件数{pm['count']} ・ 中央値{yen(pm['sold_med'])}" if pm["count"] else "対象期間に成約なし")
     with m2:
-        st.metric("🧊 売れてない最安値（現在出品）", yen(listed_price))
-        if min_listed:
-            st.caption(f"出品ID: {min_listed.get('id')}")
-        else:
-            st.caption("PSA10の出品なし")
+        st.metric("🧊 売れてない最安値（現在出品）", yen(pm["listed"]))
+        st.caption("PSA10の出品あり" if pm["listed"] else "PSA10の出品なし")
     with m3:
-        gap = (listed_price - sold_max) if (sold_max and isinstance(listed_price, int)) else None
-        st.metric("📐 最安出品 − 最高成約", yen(gap), delta=f"{gap:+,}円" if gap is not None else None)
+        st.metric("📐 最安出品 − 最高成約", yen(pm["gap"]),
+                  delta=f"{pm['gap']:+,}円" if pm["gap"] is not None else None)
         st.caption("マイナス＝最高成約より安く出ている")
 
-    with st.expander(f"成約履歴 {len(history)} 件（過去{int(lookback)}日 / PSA10）"):
-        if history:
-            st.dataframe(
-                [
-                    {"成約": h.get("date"), "価格": h.get("price"), "状態": h.get("label")}
-                    for h in history
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.write("成約なし")
+    for label, *_ in GRADES:
+        hist = grade_data[label]["history"]
+        with st.expander(f"{label} の成約履歴 {len(hist)} 件（過去{lb}日）"):
+            if hist:
+                st.dataframe(
+                    [
+                        {"成約": h.get("date"), "価格": h.get("price"),
+                         "状態": h.get("condition"), "区分": h.get("label")}
+                        for h in sorted(hist, key=lambda x: x.get("_dt") or "", reverse=True)
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.write("成約なし")
 elif not go:
     st.info("左のサイドバーに スニダンURL・商品ID・キーワード のいずれかを入れて『相場を出す』を押してください。")
