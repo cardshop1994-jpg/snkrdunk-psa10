@@ -610,6 +610,11 @@ st.markdown(
       }
       /* テーブルは横スクロール可能に（列が多くても潰れない） */
       [data-testid="stDataFrame"] { overflow-x: auto; }
+      /* 検索入力を大きく（店頭で素早く打ち込めるように）。メインのtext_inputは検索欄のみ */
+      [data-testid="stTextInput"] input {
+        font-size: 1.5rem !important; padding: 0.7rem 0.9rem !important; height: 3.2rem !important;
+      }
+      [data-testid="stTextInput"] input::placeholder { font-size: 1.0rem; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -619,22 +624,19 @@ st.title("🎴 スニダン ポケカ 相場アプリ(素体・PSA10)")
 st.caption("売れてる最高値（過去N日の成約）と 売れてない最安値（現在の最安出品）を算出")
 
 with st.form("search_form", clear_on_submit=False):
-    col_kw, col_days, col_btn = st.columns([6, 2, 2])
-    with col_kw:
-        raw = st.text_input(
-            "キーワード / スニダンURL / 商品ID",
-            value=st.session_state.get("raw", ""),
-            placeholder="例: ミュウ 054  /  リザードン SAR  /  https://snkrdunk.com/apparels/704401",
-        )
+    # 大きい入力欄を全幅で（店頭で素早く打ち込めるように）
+    raw = st.text_input(
+        "カード名 / 型番 / スニダンURL / 商品ID",
+        value=st.session_state.get("raw", ""),
+        placeholder="例: ミュウ 054 ／ リザードン SAR",
+    )
+    col_days, col_btn = st.columns([1, 1])
     with col_days:
         lookback = st.number_input("成約集計の期間（日）", 7, 365, LOOKBACK_DAYS, step=7)
     with col_btn:
-        st.markdown("<div class='btn-spacer' style='height:1.85em'></div>", unsafe_allow_html=True)  # PCでのラベル高さ合わせ（スマホでは非表示）
+        st.markdown("<div class='btn-spacer' style='height:1.85em'></div>", unsafe_allow_html=True)  # PCでのラベル高さ合わせ
         go = st.form_submit_button("🔍 相場を出す", type="primary", use_container_width=True)
-st.caption(
-    "カード名＋型番（例: `ミュウ 054`）で検索 / "
-    "スニダンのURL（`https://snkrdunk.com/apparels/...`）や商品IDを直接貼ってもOK。Enterでも検索できます。"
-)
+st.caption("カード名＋型番（例: `ミュウ 054`）で検索。Enterでも検索できます。URL・商品IDの直接貼り付けもOK。")
 
 selected_id: Optional[int] = None
 
@@ -663,10 +665,18 @@ if matches is not None and selected_id is None:
     if sugg:
         st.caption("検索候補ワード: " + " / ".join(sugg))
     if matches:
-        st.subheader(f"検索結果 {len(matches)} 件")
-        lbl = {f"[{i}] {n}": i for i, n in matches}
-        choice = st.radio("対象カードを選択", list(lbl.keys()), label_visibility="collapsed")
-        selected_id = lbl[choice]
+        if len(matches) == 1:
+            # 1件ならそのまま採用（選択不要）
+            selected_id = matches[0][0]
+        else:
+            st.subheader(f"検索結果 {len(matches)} 件")
+            lbl = {f"{n}": i for i, n in matches}
+            # キー付きセレクトボックスで選択を保持（再実行/再送信でリセットされない＝「戻る」防止）
+            choice = st.selectbox(
+                "対象カードを選択", list(lbl.keys()),
+                key=f"card_choice_{hash(tuple(i for i, _ in matches)) & 0xffff}",
+            )
+            selected_id = lbl.get(choice, matches[0][0])
     else:
         st.warning(
             "一致するカードが見つかりませんでした。キーワードを変えるか、"
