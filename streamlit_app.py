@@ -665,6 +665,8 @@ st.markdown(
         font-size: 1.5rem !important; padding: 0.7rem 0.9rem !important; height: 3.2rem !important;
       }
       [data-testid="stTextInput"] input::placeholder { font-size: 1.0rem; }
+      /* 「Press Enter to submit form」等の入力ヒントを非表示 */
+      [data-testid="InputInstructions"] { display: none !important; }
     </style>
     """,
     unsafe_allow_html=True,
