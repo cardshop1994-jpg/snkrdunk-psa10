@@ -170,7 +170,7 @@ _RARITY_RE = re.compile(r"\b(RRR|RR|SR|SAR|UR|AR|CHR|CSR|HR|GX)\b")
 # PriceChartingへのアクセスはグローバルにレート制限（429ブロック回避）
 _pc_lock = _threading.Lock()
 _pc_last = [0.0]
-_PC_MIN_INTERVAL = 0.8  # 連続リクエストの最小間隔（秒）
+_PC_MIN_INTERVAL = 0.15  # 連続リクエストの最小間隔（秒）。通常利用は軽め、429時はバックオフで保護
 _pc_sess_singleton = None
 
 
@@ -183,8 +183,9 @@ def _pc_session() -> requests.Session:
     return _pc_sess_singleton
 
 
-def _pc_get(path_or_url: str, params: Optional[dict] = None, timeout: int = 20, retries: int = 3):
-    """レート制限＋429バックオフ付きでPriceChartingにGET。失敗時は None。"""
+def _pc_get(path_or_url: str, params: Optional[dict] = None, timeout: int = 15, retries: int = 2):
+    """PriceChartingにGET。レート制限＋429バックオフ付き。
+    Cloudflareブロック(403/503の"Just a moment")や例外時は素早く諦めて None（アプリを固めない＝—表示）。"""
     sess = _pc_session()
     url = path_or_url if path_or_url.startswith("http") else f"{PC_BASE}{path_or_url}"
     for attempt in range(retries):
@@ -196,11 +197,17 @@ def _pc_get(path_or_url: str, params: Optional[dict] = None, timeout: int = 20, 
         try:
             r = sess.get(url, params=params, timeout=timeout)
         except Exception:
-            time.sleep(1.5 * (attempt + 1))
-            continue
-        if r.status_code == 429:  # レート制限 → バックオフして再試行
-            time.sleep(20 * (attempt + 1))
-            continue
+            if attempt + 1 < retries:
+                time.sleep(0.6)
+                continue
+            return None
+        if r.status_code == 429:  # レート制限 → 短くバックオフして再試行
+            if attempt + 1 < retries:
+                time.sleep(5)
+                continue
+            return None
+        if r.status_code in (403, 503):  # Cloudflareブロック等 → 連打せず即諦め
+            return None
         return r
     return None
 
@@ -671,9 +678,9 @@ if matches is not None and selected_id is None:
         else:
             st.subheader(f"検索結果 {len(matches)} 件")
             lbl = {f"{n}": i for i, n in matches}
-            # キー付きセレクトボックスで選択を保持（再実行/再送信でリセットされない＝「戻る」防止）
-            choice = st.selectbox(
-                "対象カードを選択", list(lbl.keys()),
+            # ラジオ（丸ボタン）で選択。キー付きにして再実行/再送信でも選択を保持（「戻る」防止）
+            choice = st.radio(
+                "対象カードを選択", list(lbl.keys()), label_visibility="collapsed",
                 key=f"card_choice_{hash(tuple(i for i, _ in matches)) & 0xffff}",
             )
             selected_id = lbl.get(choice, matches[0][0])
