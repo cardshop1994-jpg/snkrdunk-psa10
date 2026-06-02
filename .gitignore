@@ -3,3 +3,6 @@ __pycache__/
 .env
 .DS_Store
 .card_img_cache/
+gem_cache.json
+spec_map.json
+gem_audit_*.json

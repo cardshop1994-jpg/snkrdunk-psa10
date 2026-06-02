@@ -364,9 +364,8 @@ def _pc_resolve(detail: dict) -> Optional[tuple[str, str]]:
     return None
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_gem_auto(apparel_id: int) -> Optional[dict]:
-    """カードのGEM率を自動取得。成功時 {rate, psa10, total, set_slug, product_slug}、不可時 None。"""
+def _fetch_gem_live(apparel_id: int) -> Optional[dict]:
+    """PriceChartingからGEM率を実取得。成功時 {rate, psa10, total, set_slug, product_slug}、不可時 None。"""
     try:
         detail = fetch_apparel_detail(apparel_id)
     except Exception:
@@ -386,6 +385,50 @@ def fetch_gem_auto(apparel_id: int) -> Optional[dict]:
         "psa10": psa10, "total": total,
         "set_slug": set_slug, "product_slug": prod,
     }
+
+
+# GEM率の永続キャッシュ。一度取得したら再取得しない（PriceChartingへ二度行かない＝高速＆ブロック回避）。
+# 更新は force=True（更新ボタン）で明示的に行う。
+GEM_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gem_cache.json")
+_gem_lock = _threading.Lock()
+_gem_mem: dict = {}
+_gem_loaded = [False]
+
+
+def _gem_cache_load() -> dict:
+    if _gem_loaded[0]:
+        return _gem_mem
+    try:
+        with open(GEM_CACHE_FILE, "r", encoding="utf-8") as f:
+            _gem_mem.update({int(k): v for k, v in _json.load(f).items()})
+    except Exception:
+        pass
+    _gem_loaded[0] = True
+    return _gem_mem
+
+
+def _gem_cache_save(apparel_id: int, data: Optional[dict]) -> None:
+    with _gem_lock:
+        _gem_mem[int(apparel_id)] = data
+        try:
+            with open(GEM_CACHE_FILE, "w", encoding="utf-8") as f:
+                _json.dump({str(k): v for k, v in _gem_mem.items()}, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+
+def fetch_gem_auto(apparel_id: int, force: bool = False) -> Optional[dict]:
+    """GEM率を返す。基本は永続キャッシュ（取得済みデータ）を再利用し、PriceChartingへは行かない。
+    force=True のときだけ再取得（更新ボタン用）。"""
+    apparel_id = int(apparel_id)
+    cache = _gem_cache_load()
+    if not force and apparel_id in cache:
+        return cache[apparel_id]
+    data = _fetch_gem_live(apparel_id)
+    # 取得成功時のみ保存（失敗(None)はキャッシュせず、次回再挑戦の余地を残す）
+    if data:
+        _gem_cache_save(apparel_id, data)
+    return data
 
 
 @dataclass
@@ -710,7 +753,9 @@ if selected_id:
                 label: ex.submit(fetch_sales_history_multi, selected_id, cids, lb)
                 for label, cids, _cond_str in GRADES
             }
-            f_gem = ex.submit(fetch_gem_auto, selected_id)  # GEM率も並列取得
+            # GEM率: 基本は保存済みデータを再利用。更新ボタンが押された時だけ再取得
+            _force_gem = st.session_state.pop("force_gem_id", None) == selected_id
+            f_gem = ex.submit(fetch_gem_auto, selected_id, _force_gem)
             grade_data = {}
             for label, _cids, _cond_str in GRADES:
                 try:
@@ -786,10 +831,14 @@ if selected_id:
     with m4:
         if gem:
             st.metric("💎 GEM率", f"{gem['rate']:.1f}%")
-            st.caption(f"PSA10 {gem['psa10']:,} / 全{gem['total']:,}枚")
+            st.caption(f"PSA10 {gem['psa10']:,} / 全{gem['total']:,}枚（保存値）")
         else:
             st.metric("💎 GEM率", "—")
             st.caption("自動取得不可（旧弾/低pop/プロモ/デッキ等）。下の損益計算で取得率を手入力すれば試算できます")
+        # 保存済みの値を使い回す。最新にしたい時だけ更新
+        if st.button("🔄 GEM率を更新", key=f"gem_refresh_{selected_id}", use_container_width=True):
+            st.session_state["force_gem_id"] = selected_id
+            st.rerun()
 
     # ---------- 損益計算 ----------
     st.markdown("#### 💰 損益計算（PSAに出した場合）")
