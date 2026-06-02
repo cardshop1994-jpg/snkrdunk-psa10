@@ -161,16 +161,48 @@ def resolve_spec_id(apparel_id: int) -> Optional[int]:
 # スニダンの英語名 → PriceChartingで該当カードを特定 → セットpopページの
 # PSA10数/総数から GEM率 を自動算出（手入力不要・PSAトークン不要）。
 import html as _htmlmod
+import threading as _threading
 import urllib.parse as _urlparse
 
 PC_BASE = "https://www.pricecharting.com"
 _RARITY_RE = re.compile(r"\b(RRR|RR|SR|SAR|UR|AR|CHR|CSR|HR|GX)\b")
 
+# PriceChartingへのアクセスはグローバルにレート制限（429ブロック回避）
+_pc_lock = _threading.Lock()
+_pc_last = [0.0]
+_PC_MIN_INTERVAL = 0.8  # 連続リクエストの最小間隔（秒）
+_pc_sess_singleton = None
+
 
 def _pc_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({"User-Agent": UA})
-    return s
+    global _pc_sess_singleton
+    if _pc_sess_singleton is None:
+        s = requests.Session()
+        s.headers.update({"User-Agent": UA})
+        _pc_sess_singleton = s
+    return _pc_sess_singleton
+
+
+def _pc_get(path_or_url: str, params: Optional[dict] = None, timeout: int = 20, retries: int = 3):
+    """レート制限＋429バックオフ付きでPriceChartingにGET。失敗時は None。"""
+    sess = _pc_session()
+    url = path_or_url if path_or_url.startswith("http") else f"{PC_BASE}{path_or_url}"
+    for attempt in range(retries):
+        with _pc_lock:
+            wait = _PC_MIN_INTERVAL - (time.monotonic() - _pc_last[0])
+            if wait > 0:
+                time.sleep(wait)
+            _pc_last[0] = time.monotonic()
+        try:
+            r = sess.get(url, params=params, timeout=timeout)
+        except Exception:
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        if r.status_code == 429:  # レート制限 → バックオフして再試行
+            time.sleep(20 * (attempt + 1))
+            continue
+        return r
+    return None
 
 
 def _parse_pc_query(detail: dict) -> tuple[str, str, Optional[int], Optional[str]]:
@@ -189,14 +221,20 @@ def _parse_pc_query(detail: dict) -> tuple[str, str, Optional[int], Optional[str
     mnorm = re.search(r"(\d{1,3})\s*/\s*\d{1,3}", nm)
     if mnorm:
         card_no = int(mnorm.group(1))
-    mp = re.search(r"\b([A-Za-z0-9]{1,6}-P)\b\s*(\d{1,4})", binner)  # 例: M-P 020 / SV-P 291 / S8a-P 001
-    mp2 = re.search(r"(\d{1,4})\s*/\s*([A-Za-z0-9]{1,6}-P)\b", binner)  # 例: 030/XY-P（番号→接尾辞）
+    # プロモ接尾辞: 接尾辞→番号（M-P 020 / neo-P No.151）, 番号→接尾辞（030/XY-P）
+    mp = re.search(r"\b([A-Za-z0-9]{1,6}-P)\b\s*(?:No\.?|#)?\s*(\d{1,4})", binner)
+    mp2 = re.search(r"(\d{1,4})\s*/\s*([A-Za-z0-9]{1,6}-P)\b", binner)
     if mp:
         promo_suffix = mp.group(1).upper()
         card_no = int(mp.group(2))
     elif mp2:
         card_no = int(mp2.group(1))
         promo_suffix = mp2.group(2).upper()
+    if card_no is None:
+        # No.NNN / #NNN 形式（旧弾・Old Back等）
+        m3 = re.search(r"No\.?\s*(\d{1,4})", binner) or re.search(r"#\s*(\d{1,4})", binner)
+        if m3:
+            card_no = int(m3.group(1))
     full_subj = nm.split("[")[0].strip()
     return full_subj, set_name, card_no, promo_suffix
 
@@ -204,12 +242,9 @@ def _parse_pc_query(detail: dict) -> tuple[str, str, Optional[int], Optional[str
 @st.cache_data(ttl=86400, show_spinner=False)
 def _pc_set_pop_page(set_slug: str, page: int) -> dict:
     """PriceChartingのセットpopページ(1ページ分)から {product_slug: (PSA10数, 総数)} を取得。"""
-    sess = _pc_session()
     url = f"{PC_BASE}/pop/set/{_urlparse.quote(set_slug, safe='-&')}"
-    try:
-        r = sess.get(url, params={"page": page} if page > 1 else None, timeout=20)
-        r.raise_for_status()
-    except Exception:
+    r = _pc_get(url, params={"page": page} if page > 1 else None, timeout=20)
+    if r is None or r.status_code != 200:
         return {}
     out: dict = {}
     for m in re.finditer(r"<tr[^>]*>((?:(?!</tr>).)*?)</tr>", r.text, re.S):
@@ -235,7 +270,6 @@ def _pc_set_pop(set_slug: str, target: Optional[str] = None) -> dict:
 def _pc_resolve(detail: dict) -> Optional[tuple[str, str]]:
     """検索でカードを特定し (set_slug, product_slug) を返す。確証が無ければ None（誤答防止）。"""
     full_subj, set_name, card_no, promo = _parse_pc_query(detail)
-    sess = _pc_session()
 
     def tail_ok(prod: str) -> bool:
         t = re.search(r"-(\d+)$", prod)
@@ -271,12 +305,10 @@ def _pc_resolve(detail: dict) -> Optional[tuple[str, str]]:
         if q in seen_q:
             continue
         seen_q.add(q)
-        try:
-            r = sess.get(f"{PC_BASE}/search-products",
-                         params={"q": q, "type": "prices"}, timeout=15)
-            h = r.text
-        except Exception:
+        r = _pc_get("/search-products", params={"q": q, "type": "prices"}, timeout=15)
+        if r is None or r.status_code != 200:
             continue
+        h = r.text
         rows = re.findall(r'<tr[^>]*data-product="(\d+)"[^>]*>(.*?)</tr>', h, re.S)
         cands = []
         for _pid, row in rows:
@@ -740,7 +772,7 @@ if selected_id:
             st.caption(f"PSA10 {gem['psa10']:,} / 全{gem['total']:,}枚")
         else:
             st.metric("💎 GEM率", "—")
-            st.caption("PSA popを自動特定できず（カード名/型番が特殊な場合）")
+            st.caption("自動取得不可（旧弾/低pop/プロモ/デッキ等）。下の損益計算で取得率を手入力すれば試算できます")
 
     # ---------- 損益計算 ----------
     st.markdown("#### 💰 損益計算（PSAに出した場合）")
