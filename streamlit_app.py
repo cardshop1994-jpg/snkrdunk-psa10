@@ -43,6 +43,11 @@ GRADES = [
 GRADING_FEE = {"レギュラー": 13000, "バリューバルク": 5300}
 SALES_FEE_RATE = 0.10  # メルカリ等の販売手数料
 
+# 対応タイトル。値はスニダンの brandId（検索の絞り込みに使用）。
+# グレード(素体/PSA9/PSA10)・condition ID・損益計算はどのタイトルでも共通。
+# GEM率(PriceCharting)だけは英語名の番号体系が違うためタイトル別にパースする。
+BRANDS = {"ポケモン": "pokemon", "ワンピース": "onepiece"}
+
 
 def profit_margin(acq_rate: float, raw_price: int, psa10_price: int, fee: int,
                   sales_fee: float = SALES_FEE_RATE) -> Optional[dict]:
@@ -364,13 +369,92 @@ def _pc_resolve(detail: dict) -> Optional[tuple[str, str]]:
     return None
 
 
-def _fetch_gem_live(apparel_id: int) -> Optional[dict]:
+def _parse_pc_query_op(detail: dict) -> tuple[str, str, Optional[str], Optional[int], bool]:
+    """ワンピの英語名から (主語, セット名, セットコード, カード番号, プロモか) を抽出。
+    例: 'Monkey D Luffy SEC-P [OP05-119] (Booster Pack ...)' → ('Monkey D Luffy', 'Awakening...', 'OP05', 119, False)
+        'Monkey D Luffy [P-033] (...)' → (..., '...', 'P', 33, True)
+    ワンピの型番は [OP05-119] / [ST30-001] / [EB01-...] / [P-033] のように 'セット-番号' 形式（ポケカの054/172と異なる）。"""
+    nm = detail.get("name") or detail.get("localizedName") or ""
+    setm = re.findall(r"\(([^()]*)\)\s*$", nm)
+    set_name = setm[-1] if setm else ""
+    for junk in ['"', "Booster Pack", "Starter Deck", "Extra Booster", "Premium Booster",
+                 "Promotional Card", "Freebie"]:
+        set_name = set_name.replace(junk, "")
+    set_name = re.sub(r"\s+", " ", set_name).strip()
+    set_code: Optional[str] = None
+    card_no: Optional[int] = None
+    mb = re.search(r"\[([A-Za-z]+\d*)-(\d+)\]", nm)
+    if mb:
+        set_code = mb.group(1).upper()
+        card_no = int(mb.group(2))
+    is_promo = set_code == "P"
+    subject = nm.split("[")[0]
+    subject = re.sub(r"[:：].*$", "", subject)  # ': P' 等の末尾レアリティ注記を除去
+    # 末尾のレアリティ表記（SEC-P/SR/SEC/UC/L/R/C/P 等）を除去
+    subject = re.sub(r"\s+(SEC-P|SP-CARD|SEC|RRR|SR|SP|UC|CR|TR|L|R|C|P)\s*$", "",
+                     subject.strip(), flags=re.I)
+    subject = re.sub(r"\s+", " ", subject).strip()
+    return subject, set_name, set_code, card_no, is_promo
+
+
+def _pc_resolve_op(detail: dict) -> Optional[tuple[str, str]]:
+    """ワンピのカードをPriceChartingで特定し (set_slug, product_slug) を返す。
+    日本語版(set_slugに'japanese')かつ番号末尾一致のみ採用（英語版popを誤って返さない）。確証無ければ None。"""
+    subject, set_name, set_code, card_no, is_promo = _parse_pc_query_op(detail)
+    if not subject or card_no is None:
+        return None
+
+    def tail_ok(prod: str) -> bool:
+        t = re.search(r"-(\d+)$", prod)
+        return bool(t) and int(t.group(1)) == card_no
+
+    queries = []
+    if set_code:
+        queries.append(f"{subject} {set_code}-{card_no:03d} japanese")
+        queries.append(f"{subject} one piece {set_code}-{card_no:03d}")
+    queries.append(f"{subject} one piece japanese {set_name}".strip())
+    queries.append(f"{subject} one piece japanese")
+    queries.append(f"{subject} one piece {set_name}".strip())
+    base_token = subject.split()[0].lower() if subject.split() else ""
+    seen_q: set = set()
+    for q in queries:
+        if q in seen_q:
+            continue
+        seen_q.add(q)
+        r = _pc_get("/search-products", params={"q": q, "type": "prices"}, timeout=15)
+        if r is None or r.status_code != 200:
+            continue
+        rows = re.findall(r'<tr[^>]*data-product="(\d+)"[^>]*>(.*?)</tr>', r.text, re.S)
+        cands = []
+        for _pid, row in rows:
+            txt = re.sub(r"\s+", " ", _htmlmod.unescape(re.sub(r"<[^>]+>", " ", row))).strip()
+            href = re.search(r'/game/([^/"]+)/([^/"?]+)"', row)
+            if not href:
+                continue
+            setslug = _htmlmod.unescape(href.group(1))
+            prod = _htmlmod.unescape(href.group(2))
+            is_jp = "japanese" in setslug.lower() or "Japanese" in txt
+            is_op = "one-piece" in setslug.lower() or "one piece" in txt.lower()
+            subj_ok = (base_token in txt.lower()) if base_token else True
+            if is_op and is_jp and tail_ok(prod) and subj_ok:
+                cands.append((setslug, prod))
+        cands = list(dict.fromkeys(cands))
+        if len(cands) == 1:
+            return cands[0]
+        if len(cands) > 1:
+            pick = sorted(cands, key=lambda c: len(c[1]))  # 余計な修飾の無い基本カードを優先
+            if len(pick[0][1]) < len(pick[1][1]):
+                return pick[0]
+    return None
+
+
+def _fetch_gem_live(apparel_id: int, brand: str = "pokemon") -> Optional[dict]:
     """PriceChartingからGEM率を実取得。成功時 {rate, psa10, total, set_slug, product_slug}、不可時 None。"""
     try:
         detail = fetch_apparel_detail(apparel_id)
     except Exception:
         return None
-    res = _pc_resolve(detail)
+    res = _pc_resolve_op(detail) if brand == "onepiece" else _pc_resolve(detail)
     if not res:
         return None
     set_slug, prod = res
@@ -417,14 +501,14 @@ def _gem_cache_save(apparel_id: int, data: Optional[dict]) -> None:
             pass
 
 
-def fetch_gem_auto(apparel_id: int, force: bool = False) -> Optional[dict]:
+def fetch_gem_auto(apparel_id: int, force: bool = False, brand: str = "pokemon") -> Optional[dict]:
     """GEM率を返す。基本は永続キャッシュ（取得済みデータ）を再利用し、PriceChartingへは行かない。
-    force=True のときだけ再取得（更新ボタン用）。"""
+    force=True のときだけ再取得（更新ボタン用）。brand でポケカ/ワンピのパースを切替。"""
     apparel_id = int(apparel_id)
     cache = _gem_cache_load()
     if not force and apparel_id in cache:
         return cache[apparel_id]
-    data = _fetch_gem_live(apparel_id)
+    data = _fetch_gem_live(apparel_id, brand)
     # 取得成功時のみ保存（失敗(None)はキャッシュせず、次回再挑戦の余地を残す）
     if data:
         _gem_cache_save(apparel_id, data)
@@ -672,15 +756,25 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("🎴 スニダン ポケカ 相場アプリ(素体・PSA10)")
+# タイトル選択（ポケモン / ワンピース）。グレード・相場ロジックは共通、検索ブランドとGEM率パースが切替わる。
+brand_label = st.radio("対象タイトル", list(BRANDS.keys()), horizontal=True, key="brand_label")
+brand = BRANDS[brand_label]
+# タイトルを切替えたら前タイトルの検索結果をクリア（別タイトルの結果が残らないように）
+if st.session_state.get("_last_brand") not in (None, brand):
+    for _k in ("matches", "direct_id", "suggestions", "raw"):
+        st.session_state.pop(_k, None)
+st.session_state["_last_brand"] = brand
+
+st.title(f"🎴 スニダン {brand_label} 相場アプリ(素体・PSA10)")
 st.caption("売れてる最高値（過去N日の成約）と 売れてない最安値（現在の最安出品）を算出")
 
+_placeholder = "例: ミュウ 054 ／ リザードン SAR" if brand == "pokemon" else "例: ルフィ OP05 ／ ヤマト SR"
 with st.form("search_form", clear_on_submit=False):
     # 大きい入力欄を全幅で（店頭で素早く打ち込めるように）
     raw = st.text_input(
         "カード名 / 型番 / スニダンURL / 商品ID",
         value=st.session_state.get("raw", ""),
-        placeholder="例: ミュウ 054 ／ リザードン SAR",
+        placeholder=_placeholder,
     )
     col_days, col_btn = st.columns([1, 1])
     with col_days:
@@ -698,7 +792,7 @@ if go and raw.strip():
     if selected_id is None:
         # キーワード扱い（フリーワード検索）
         kw = raw.strip()
-        matches = search_keyword(kw)
+        matches = search_keyword(kw, brand)
         st.session_state["matches"] = [(c.apparel_id, c.name) for c in matches]
         st.session_state["suggestions"] = fetch_keyword_suggestions(kw)
         st.session_state.pop("direct_id", None)
@@ -757,7 +851,7 @@ if selected_id:
             }
             # GEM率: 基本は保存済みデータを再利用。更新ボタンが押された時だけ再取得
             _force_gem = st.session_state.pop("force_gem_id", None) == selected_id
-            f_gem = ex.submit(fetch_gem_auto, selected_id, _force_gem)
+            f_gem = ex.submit(fetch_gem_auto, selected_id, _force_gem, brand)
             grade_data = {}
             for label, _cids, _cond_str in GRADES:
                 try:
