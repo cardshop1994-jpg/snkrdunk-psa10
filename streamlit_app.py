@@ -471,10 +471,9 @@ def _fetch_gem_live(apparel_id: int, brand: str = "pokemon") -> Optional[dict]:
     }
 
 
-# GEM率のキャッシュ。取得値を保存して再利用するが、GEM_TTL_DAYS を超えたら自動で最新化する。
-# 取得元PriceChartingがブロック中など再取得に失敗した場合は、前回値を保持し続ける（—にしない）。
+# GEM率のキャッシュ。保存値があればそのまま使い、表示中はPriceChartingへ一切アクセスしない（＝軽い）。
+# 更新は「🔄 GEM率を更新」ボタン(force=True)を押した時だけ。GEM率は頻繁に変わらないので自動更新は不要。
 GEM_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gem_cache.json")
-GEM_TTL_DAYS = 7  # この日数を超えた保存値は、次に表示した時に自動で取り直す
 _gem_lock = _threading.Lock()
 _gem_mem: dict = {}
 _gem_loaded = [False]
@@ -494,8 +493,6 @@ def _gem_cache_load() -> dict:
 
 def _gem_cache_save(apparel_id: int, data: Optional[dict]) -> None:
     with _gem_lock:
-        if data:
-            data = dict(data, _ts=datetime.now().isoformat())  # 取得時刻を記録（TTL判定用）
         _gem_mem[int(apparel_id)] = data
         try:
             with open(GEM_CACHE_FILE, "w", encoding="utf-8") as f:
@@ -504,33 +501,20 @@ def _gem_cache_save(apparel_id: int, data: Optional[dict]) -> None:
             pass
 
 
-def _gem_is_fresh(entry: Optional[dict]) -> bool:
-    """保存値が GEM_TTL_DAYS 以内なら True。_ts無し（旧キャッシュ）は古い扱い。"""
-    if not entry:
-        return False
-    ts = entry.get("_ts")
-    if not ts:
-        return False
-    try:
-        return (datetime.now() - datetime.fromisoformat(ts)) < timedelta(days=GEM_TTL_DAYS)
-    except Exception:
-        return False
-
-
 def fetch_gem_auto(apparel_id: int, force: bool = False, brand: str = "pokemon") -> Optional[dict]:
-    """GEM率を返す。保存値があり新しければ即返す（高速）。TTL超過 or force のときだけ
-    PriceChartingから取り直して最新化する。取り直しに失敗（ブロック等）したら前回値を保持。
+    """GEM率を返す。通常表示では保存値をそのまま返すだけで、PriceChartingへは行かない（＝軽い）。
+    未取得カードは None（—表示）。取得・更新は「🔄 GEM率を更新」(force=True)を押した時のみ。
     brand でポケカ/ワンピのパースを切替。"""
     apparel_id = int(apparel_id)
     cache = _gem_cache_load()
     entry = cache.get(apparel_id)
-    if entry and _gem_is_fresh(entry) and not force:
-        return entry  # 新しい保存値 → そのまま（PriceChartingへ行かない＝速い）
-    data = _fetch_gem_live(apparel_id, brand)
+    if not force:
+        return entry  # 保存値（無ければNone=—）。表示中は取りに行かない＝速い
+    data = _fetch_gem_live(apparel_id, brand)  # 🔄ボタン時のみ取得
     if data:
-        _gem_cache_save(apparel_id, data)  # 最新化
+        _gem_cache_save(apparel_id, data)
         return data
-    return entry  # 取り直し失敗 → 前回値を保持（無ければNone）
+    return entry  # 取得失敗（ブロック等）→ 前回値を保持
 
 
 @dataclass
